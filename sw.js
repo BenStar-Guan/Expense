@@ -1,5 +1,5 @@
 // ===== Service Worker — 消费记账 PWA (Full) =====
-const CACHE_NAME = 'expense-tracker-v11';
+const CACHE_NAME = 'expense-tracker-v12';
 const ASSETS = [
   './',
   './index.html',
