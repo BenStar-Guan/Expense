@@ -1082,6 +1082,22 @@ body {
         </div>
         <button class="btn btn-secondary" id="exportBtn" style="width:auto;padding:8px 16px;font-size:13px;">导出</button>
       </div>
+      <!-- ===== 导入数据 ===== -->
+      <div class="setting-item">
+        <div>
+          <div class="setting-title">导入 JSON (恢复)</div>
+          <div class="setting-desc">选择之前导出的备份文件，恢复全部记录</div>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <select id="importMode" style="padding:8px 12px; border:1px solid #E5E7EB;
+                  border-radius:8px; font-size:14px; background:#fff;">
+            <option value="merge">合并</option>
+            <option value="replace">覆盖</option>
+          </select>
+          <button class="btn" id="btnImportJson">导入</button>
+          <input type="file" id="fileJsonInput" accept=".json,application/json" hidden>
+        </div>
+      </div>
       <div class="toggle-row">
         <div>
           <div class="toggle-label">清空全部数据</div>
@@ -2561,6 +2577,132 @@ checkPwaStatus();
     window.history.replaceState({}, document.title, cleanUrl);
   }
 })();
+// ============================================================
+// 导入数据模块 — 消费记账
+// ============================================================
+
+// ⚠️ 对接点 1：改成您 Dexie 实例的变量名和表名
+// 例如您代码里是 const db = new Dexie('ExpenseDB'); db.version(1).stores({ expenses: '...' })
+const IMPORT_DB = db;            // 您的 Dexie 实例变量名
+const IMPORT_TABLE = 'expenses'; // 您的表名
+
+// ⚠️ 对接点 2：改成您应用中的完整分类列表（与记账页"选择分类"一致）
+const IMPORT_CATEGORIES = [
+  '餐饮', '交通', '购物', '娱乐', '居住',
+  '医疗', '教育', '通讯', '其他'
+];
+
+// ---------- 工具函数 ----------
+
+function parseAmount(val) {
+  if (typeof val === 'number' && isFinite(val) && val > 0) return +val.toFixed(2);
+  if (typeof val !== 'string') return null;
+  const num = parseFloat(val.replace(/[¥￥$,，\s]/g, ''));
+  return (isFinite(num) && num > 0) ? +num.toFixed(2) : null;
+}
+
+function parseDate(val) {
+  if (val == null || val === '') return new Date().toISOString().slice(0, 10);
+  if (typeof val === 'number') return new Date(val).toISOString().slice(0, 10);
+  const s = String(val).trim();
+  const m = s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/);
+  if (m) {
+    const [y, mo, d] = [+m[1], +m[2], +m[3]];
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31)
+      return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  const dt = new Date(s);
+  return isNaN(dt) ? null : dt.toISOString().slice(0, 10);
+}
+
+// 把一条原始记录规范化，无效返回 null
+function normalizeRecord(raw) {
+  const amount = parseAmount(raw.amount ?? raw.金额);
+  if (amount == null) return null;
+
+  let category = String(raw.category ?? raw.分类 ?? '其他');
+  if (!IMPORT_CATEGORIES.includes(category)) category = '其他';
+
+  const date = parseDate(raw.date ?? raw.日期);
+  if (!date) return null;
+
+  return {
+    amount,
+    category,
+    date,
+    note: String(raw.note ?? raw.remark ?? raw.备注 ?? '').slice(0, 200)
+  };
+}
+
+function fingerprint(r) {
+  return `${r.date}|${r.amount}|${r.category}|${r.note}`;
+}
+
+// ---------- 主流程 ----------
+
+async function handleJsonImport(fileText) {
+  let data;
+  try { data = JSON.parse(fileText); }
+  catch { return alert('导入失败：不是有效的 JSON 文件'); }
+
+  // ⚠️ 对接点 3：与您「导出 JSON」的格式对齐
+  // 常见结构都做了兼容：{records:[...]} / {expenses:[...]} / {data:[...]} / [...]
+  const list = Array.isArray(data) ? data
+    : Array.isArray(data.records) ? data.records
+    : Array.isArray(data.expenses) ? data.expenses
+    : Array.isArray(data.data) ? data.data
+    : null;
+  if (!list) return alert('导入失败：未找到记录数组，请确认是本应用导出的备份');
+
+  const records = list.map(normalizeRecord).filter(Boolean);
+  if (!records.length) return alert('导入失败：文件中没有有效记录');
+
+  const mode = document.getElementById('importMode').value;
+  if (mode === 'replace' &&
+      !confirm(`覆盖导入将先删除现有全部记录，再导入 ${records.length} 笔。\n建议先点"导出 JSON"备份当前数据。\n\n确定继续吗？`)) {
+    return;
+  }
+
+  let added = records.length;
+  try {
+    if (mode === 'replace') {
+      await IMPORT_DB.table(IMPORT_TABLE).clear();
+    } else {
+      // 合并模式去重
+      const existing = await IMPORT_DB.table(IMPORT_TABLE).toArray();
+      const seen = new Set(existing.map(fingerprint));
+      const fresh = records.filter(r => !seen.has(fingerprint(r)));
+      added = fresh.length;
+      records.length = 0;
+      records.push(...fresh);
+      if (!added) return alert('导入的记录全部已存在（按日期+金额+分类+备注判定重复），未添加新数据');
+    }
+
+    await IMPORT_DB.table(IMPORT_TABLE).bulkAdd(records);
+    alert(`✅ 导入成功：${added} 笔记录\n（${mode === 'replace' ? '覆盖模式' : '合并模式'}）`);
+
+    // ⚠️ 对接点 4：调用您已有的界面刷新函数
+    // 如果不确定函数名，直接用 location.reload() 也可以
+    location.reload();
+  } catch (err) {
+    alert('导入出错：' + err.message);
+  }
+}
+
+// ---------- 绑定事件 ----------
+
+document.getElementById('btnImportJson').addEventListener('click', () => {
+  document.getElementById('fileJsonInput').click();
+});
+
+document.getElementById('fileJsonInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => handleJsonImport(reader.result);
+  reader.readAsText(file, 'utf-8');
+  e.target.value = ''; // 允许再次选择同一文件
+});
 
 </script>
 </body>
