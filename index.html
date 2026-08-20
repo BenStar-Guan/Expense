@@ -2577,20 +2577,14 @@ checkPwaStatus();
     window.history.replaceState({}, document.title, cleanUrl);
   }
 })();
-// ============================================================
-// 导入数据模块 — 消费记账
+
+  // ============================================================
+// 导入数据模块 — 针对 data.json 结构定制
+// 结构: { records: [...], budget: {...}, categories: [...] }
 // ============================================================
 
-// ⚠️ 对接点 1：改成您 Dexie 实例的变量名和表名
-// 例如您代码里是 const db = new Dexie('ExpenseDB'); db.version(1).stores({ expenses: '...' })
-const IMPORT_DB = db;            // 您的 Dexie 实例变量名
-const IMPORT_TABLE = 'expenses'; // 您的表名
-
-// ⚠️ 对接点 2：改成您应用中的完整分类列表（与记账页"选择分类"一致）
-const IMPORT_CATEGORIES = [
-  '餐饮', '交通', '购物', '娱乐', '居住',
-  '医疗', '教育', '通讯', '其他'
-];
+// ⚠️ 对接点：IMPORT_DB 改成您代码里 Dexie 实例的实际变量名
+const IMPORT_DB = db;
 
 // ---------- 工具函数 ----------
 
@@ -2603,7 +2597,6 @@ function parseAmount(val) {
 
 function parseDate(val) {
   if (val == null || val === '') return new Date().toISOString().slice(0, 10);
-  if (typeof val === 'number') return new Date(val).toISOString().slice(0, 10);
   const s = String(val).trim();
   const m = s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/);
   if (m) {
@@ -2611,31 +2604,39 @@ function parseDate(val) {
     if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31)
       return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
   }
-  const dt = new Date(s);
-  return isNaN(dt) ? null : dt.toISOString().slice(0, 10);
+  return null;
 }
 
-// 把一条原始记录规范化，无效返回 null
+// 生成新 id（保持与您现有 id 风格一致的随机字符串）
+function genId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+
+// 规范化一条记录（字段：id/amount/category/date/note/createdAt）
 function normalizeRecord(raw) {
-  const amount = parseAmount(raw.amount ?? raw.金额);
+  const amount = parseAmount(raw.amount);
   if (amount == null) return null;
 
-  let category = String(raw.category ?? raw.分类 ?? '其他');
-  if (!IMPORT_CATEGORIES.includes(category)) category = '其他';
-
-  const date = parseDate(raw.date ?? raw.日期);
+  const date = parseDate(raw.date);
   if (!date) return null;
 
+  // category 直接保留原始值（food/housing 等英文 id）
+  // 不存在或为空时归为 'other'
+  const category = raw.category || 'other';
+
   return {
+    id: raw.id || genId(),           // 有 id 用原 id，没有就生成
     amount,
     category,
     date,
-    note: String(raw.note ?? raw.remark ?? raw.备注 ?? '').slice(0, 200)
+    note: String(raw.note ?? '').slice(0, 200),
+    createdAt: raw.createdAt || new Date().toISOString()
   };
 }
 
+// 去重依据：优先用 id，其次用 内容指纹
 function fingerprint(r) {
-  return `${r.date}|${r.amount}|${r.category}|${r.note}`;
+  return r.id || `${r.date}|${r.amount}|${r.category}|${r.note}`;
 }
 
 // ---------- 主流程 ----------
@@ -2645,12 +2646,9 @@ async function handleJsonImport(fileText) {
   try { data = JSON.parse(fileText); }
   catch { return alert('导入失败：不是有效的 JSON 文件'); }
 
-  // ⚠️ 对接点 3：与您「导出 JSON」的格式对齐
-  // 常见结构都做了兼容：{records:[...]} / {expenses:[...]} / {data:[...]} / [...]
   const list = Array.isArray(data) ? data
     : Array.isArray(data.records) ? data.records
     : Array.isArray(data.expenses) ? data.expenses
-    : Array.isArray(data.data) ? data.data
     : null;
   if (!list) return alert('导入失败：未找到记录数组，请确认是本应用导出的备份');
 
@@ -2659,30 +2657,40 @@ async function handleJsonImport(fileText) {
 
   const mode = document.getElementById('importMode').value;
   if (mode === 'replace' &&
-      !confirm(`覆盖导入将先删除现有全部记录，再导入 ${records.length} 笔。\n建议先点"导出 JSON"备份当前数据。\n\n确定继续吗？`)) {
+      !confirm(`覆盖导入将先删除现有全部记录，再导入 ${records.length} 笔。\n确定继续吗？`)) {
     return;
   }
 
-  let added = records.length;
   try {
+    let added = records.length;
+
     if (mode === 'replace') {
-      await IMPORT_DB.table(IMPORT_TABLE).clear();
+      await IMPORT_DB.records.clear();
     } else {
-      // 合并模式去重
-      const existing = await IMPORT_DB.table(IMPORT_TABLE).toArray();
+      // 合并模式：按 id / 指纹去重
+      const existing = await IMPORT_DB.records.toArray();
       const seen = new Set(existing.map(fingerprint));
       const fresh = records.filter(r => !seen.has(fingerprint(r)));
       added = fresh.length;
+      if (!added) return alert('导入的记录全部已存在，未添加新数据');
       records.length = 0;
       records.push(...fresh);
-      if (!added) return alert('导入的记录全部已存在（按日期+金额+分类+备注判定重复），未添加新数据');
     }
 
-    await IMPORT_DB.table(IMPORT_TABLE).bulkAdd(records);
-    alert(`✅ 导入成功：${added} 笔记录\n（${mode === 'replace' ? '覆盖模式' : '合并模式'}）`);
+    await IMPORT_DB.records.bulkPut(records);
 
-    // ⚠️ 对接点 4：调用您已有的界面刷新函数
-    // 如果不确定函数名，直接用 location.reload() 也可以
+    // 恢复预算（覆盖模式下）
+    if (mode === 'replace' && data.budget && data.budget.monthlyLimit) {
+      // ⚠️ 对接点：预算存在哪个表请按您的实际情况调整
+      // 常见两种方式，删掉不适用的那种：
+      await IMPORT_DB.records ? null : null;
+      // 方式A：预算存在单独的表（如表名 settings / meta）
+      // await IMPORT_DB.settings.put({ key: 'budget', value: data.budget.monthlyLimit });
+      // 方式B：预算存在 localStorage
+      localStorage.setItem('monthlyBudget', data.budget.monthlyLimit);
+    }
+
+    alert(`✅ 导入成功：${added} 笔记录（${mode === 'replace' ? '覆盖模式' : '合并模式'}）`);
     location.reload();
   } catch (err) {
     alert('导入出错：' + err.message);
@@ -2701,8 +2709,9 @@ document.getElementById('fileJsonInput').addEventListener('change', (e) => {
   const reader = new FileReader();
   reader.onload = () => handleJsonImport(reader.result);
   reader.readAsText(file, 'utf-8');
-  e.target.value = ''; // 允许再次选择同一文件
+  e.target.value = '';
 });
+
 
 </script>
 </body>
