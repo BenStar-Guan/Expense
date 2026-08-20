@@ -9,6 +9,8 @@ const ASSETS = [
   './apple-touch-icon.png',
   'https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap',
   'https://unpkg.com/dexie@4.0.8/dist/dexie.min.js',
+  'https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js',
+
 ];
 
 // ===== Install — pre-cache core assets =====
