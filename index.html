@@ -19,6 +19,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/dexie@4.0.8/dist/dexie.min.js"></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <style>
 /* ===== Design Tokens (Clean Style) ===== */
 :root {
@@ -1096,6 +1097,20 @@ body {
           </select>
           <button class="btn" id="btnImportJson">导入</button>
           <input type="file" id="fileJsonInput" accept=".json,application/json" hidden>
+        </div>
+      </div>
+      <div class="setting-item">
+        <div>
+          <div class="setting-title">导入 Excel (表格)</div>
+          <div class="setting-desc">支持 .xlsx / .xls 文件，自动识别列名</div>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <select id="excelImportMode" style="padding:8px 12px; border:1px solid #E5E7EB; border-radius:8px;">
+            <option value="merge">合并</option>
+            <option value="replace">覆盖</option>
+          </select>
+          <button class="btn" id="btnImportExcel">导入</button>
+          <input type="file" id="fileExcelInput" accept=".xlsx,.xls" hidden>
         </div>
       </div>
       <div class="toggle-row">
@@ -2712,6 +2727,168 @@ document.getElementById('fileJsonInput').addEventListener('change', (e) => {
   e.target.value = '';
 });
 
+// ============================================================
+// Excel 导入模块（独立命名空间，不与 JSON 导入冲突）
+// ============================================================
+(function() {
+
+  // 分类映射：Excel 中文分类名 → 数据库英文 id
+  var CAT_MAP = {
+    '餐饮': 'food', '吃饭': 'food', 'food': 'food',
+    '交通': 'transport', '出行': 'transport', 'transport': 'transport',
+    '购物': 'shopping', 'shopping': 'shopping',
+    '娱乐': 'entertainment', 'entertainment': 'entertainment',
+    '居住': 'housing', '住房': 'housing', 'housing': 'housing',
+    '医疗': 'medical', 'medical': 'medical',
+    '教育': 'education', 'education': 'education',
+    'other': 'other'
+  };
+
+  function toAmount(val) {
+    if (typeof val === 'number' && isFinite(val) && val > 0) return +val.toFixed(2);
+    if (typeof val !== 'string') return null;
+    var num = parseFloat(val.replace(/[¥￥$,，\s]/g, ''));
+    return (isFinite(num) && num > 0) ? +num.toFixed(2) : null;
+  }
+
+  function toDateString(val) {
+    if (val == null || val === '') return null;
+    // SheetJS 开 cellDates 后日期是 Date 对象
+    if (val instanceof Date && !isNaN(val)) {
+      return val.getFullYear() + '-' + String(val.getMonth() + 1).padStart(2, '0')
+           + '-' + String(val.getDate()).padStart(2, '0');
+    }
+    // Excel 日期序列号（数字）
+    if (typeof val === 'number' && val > 20000 && val < 60000) {
+      var d = new Date(1899, 11, 30);
+      d.setDate(d.getDate() + Math.floor(val));
+      return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0')
+           + '-' + String(d.getDate()).padStart(2, '0');
+    }
+    // 字符串日期
+    var s = String(val).trim();
+    var m = s.match(/^(\d{4})[-\/.年](\d{1,2})[-\/.月](\d{1,2})/);
+    if (m) {
+      var y = +m[1], mo = +m[2], dd = +m[3];
+      if (mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31)
+        return y + '-' + String(mo).padStart(2, '0') + '-' + String(dd).padStart(2, '0');
+    }
+    return null;
+  }
+
+  function toCategory(raw) {
+    if (!raw) return 'other';
+    return CAT_MAP[String(raw).trim().toLowerCase()] || 'other';
+  }
+
+  function newId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  }
+
+  async function handleExcelImport(arrayBuffer) {
+    var workbook;
+    try {
+      // cellDates: true —— 让日期单元格自动变成 Date 对象，避免拿到 44927 这类序列号
+      workbook = XLSX.read(new Uint8Array(arrayBuffer), { type: 'array', cellDates: true });
+    } catch (err) {
+      return alert('Excel 解析失败：文件可能损坏或不是有效的 Excel 文件');
+    }
+
+    var sheet = workbook.Sheets[workbook.SheetNames[0]];
+    var rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+    if (rows.length < 2) return alert('Excel 内容为空或只有表头');
+
+    // ---- 识别表头 ----
+    var header = rows[0].map(function(h) { return String(h).trim().toLowerCase(); });
+    function findCol(names) {
+      for (var i = 0; i < names.length; i++) {
+        var idx = header.indexOf(names[i]);
+        if (idx > -1) return idx;
+      }
+      return -1;
+    }
+    var colAmount   = findCol(['金额', 'amount', '消费', '支出', '价格']);
+    var colCategory = findCol(['分类', '类别', 'category', '类型']);
+    var colDate     = findCol(['日期', '时间', 'date', '记账日期']);
+    var colNote     = findCol(['备注', '说明', 'note', 'remark', '描述', '项目']);
+
+    if (colAmount === -1) {
+      return alert('未找到「金额」列。\n\n请确保 Excel 第一行是表头，且包含列名：\n金额 / amount / 消费 / 支出');
+    }
+
+    // ---- 逐行解析 ----
+    var records = [], skipped = 0;
+    for (var i = 1; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row || row.every(function(c) { return c === '' || c == null; })) continue;
+
+      var amount = toAmount(row[colAmount]);
+      if (amount == null) { skipped++; continue; }
+
+      var date = toDateString(colDate > -1 ? row[colDate] : '')
+              || new Date().toISOString().slice(0, 10);
+
+      records.push({
+        id: newId(),
+        amount: amount,
+        category: toCategory(colCategory > -1 ? row[colCategory] : ''),
+        date: date,
+        note: colNote > -1 ? String(row[colNote] ?? '').slice(0, 200) : '',
+        createdAt: new Date().toISOString()
+      });
+    }
+
+    if (!records.length) return alert('没有解析出有效记录，请检查金额列是否为正数');
+
+    // ---- 写入数据库 ----
+    var mode = document.getElementById('excelImportMode').value;
+    if (mode === 'replace' &&
+        !confirm('覆盖导入将先删除现有全部记录，再导入 ' + records.length + ' 笔。\n确定继续吗？')) {
+      return;
+    }
+
+    try {
+      if (mode === 'replace') {
+        await db.records.clear();
+      } else {
+        // 合并模式：按 内容（日期+金额+分类+备注）去重
+        var existing = await db.records.toArray();
+        var seen = new Set(existing.map(function(r) {
+          return r.date + '|' + r.amount + '|' + r.category + '|' + r.note;
+        }));
+        var fresh = records.filter(function(r) {
+          return !seen.has(r.date + '|' + r.amount + '|' + r.category + '|' + r.note);
+        });
+        if (!fresh.length) return alert('导入的记录全部已存在，未添加新数据');
+        records = fresh;
+      }
+
+      await db.records.bulkPut(records);
+
+      var msg = '✅ Excel 导入成功：' + records.length + ' 笔';
+      if (skipped > 0) msg += '\n⚠️ 跳过 ' + skipped + ' 行无效数据（金额非正数或格式错误）';
+      alert(msg);
+      location.reload();
+    } catch (err) {
+      alert('写入数据库出错：' + err.message);
+    }
+  }
+
+  // ---- 绑定事件 ----
+  document.getElementById('btnImportExcel').addEventListener('click', function() {
+    document.getElementById('fileExcelInput').click();
+  });
+
+  document.getElementById('fileExcelInput').addEventListener('change', function(e) {
+    var file = e.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function() { handleExcelImport(reader.result); };
+    reader.readAsArrayBuffer(file);  // Excel 是二进制，必须用 ArrayBuffer
+    e.target.value = '';
+  });
+
+})();
 
 </script>
 </body>
